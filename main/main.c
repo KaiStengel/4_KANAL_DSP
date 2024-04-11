@@ -26,6 +26,8 @@
 #define BitWidth 24
 #define Samplerate 96000
 #define k_buffer 1280
+#define i2s_buf_len (k_buffer*BitWidth*2/8)
+#define chan_buf_len (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1))
 
 //iir
 float *coeff;
@@ -39,12 +41,11 @@ static i2s_chan_handle_t rx_handle_0;
 static i2s_chan_handle_t tx_handle_1;
 static i2s_chan_handle_t rx_handle_1;
 
-
-//evtl ist output als 4 kanäle zu implementieren
+//seperating a i2s buffer and converting from 3x8bit int into 1x32bit float valued buffers with values between 1 and -1
 void converting(int8_t *in, float *left, float *right){
     int j = 0;
-    //seperating the channels and converting from 3x8bit int into 1x32bit float valued buffers
-    for(int i = 0; i < k_buffer*BitWidth/8/(BitWidth/8 +1); i++){
+    
+    for(int i = 0; i < chan_buf_len; i++){
         left[i] = ((float)(((in[j+1] << 16) & 0xFF0000) | ((in[j+2] << 8) & 0xFF00) | (in[j+3] & 0xFF)))/8388608.0f;
        
         right[i] = (float)(((in[j+5] << 16) & 0xFF0000) | ((in[j+6] << 8) & 0xFF00) | (in[j+7] & 0xFF))/8388608.0f;
@@ -54,14 +55,13 @@ void converting(int8_t *in, float *left, float *right){
 
 }
 
+//seperating channel buffers and converting from 1x32bit float valued buffers with values between 1 and -1 into 3x8bit int i2s buffer
 void reconverting(int8_t *out, float *left, float *right){
     int j = 0;
     for(int i = 0; i < (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)); i++){
 
             //Left
-        float l = 8388607.0f*left[i];
-        if(l > 8388607) l = 8388607;
-        else if(l < -8388608) l = -8388608;
+        float l = 8388608.0f*left[i];
         out[j] = 0x00;
         out[j+1] = (int8_t)(((int32_t)(l) >> 16) & 0xFF);
         out[j+2] = (int8_t)(((int32_t)(l) >> 8) & 0xFF);
@@ -70,8 +70,6 @@ void reconverting(int8_t *out, float *left, float *right){
 
             //Right
         float r = 8388608.0f*right[i];
-        if(r > 8388607) r = 8388607;
-        else if(r < -8388608) r = -8388608;
         out[j+4] = 0x00;
         out[j+5] = (int8_t)(((int32_t)(r) >> 16) & 0xFF);
         out[j+6] = (int8_t)(((int32_t)(r) >> 8) & 0xFF);
@@ -84,17 +82,27 @@ void reconverting(int8_t *out, float *left, float *right){
 
 //evtl output als 4 kanäle
 void eq(float *ch1, float *ch2, float *ch3, float *ch4){
-    float *temp3 = (float *)calloc((k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), sizeof(float));
+    //temp arrays
+    float *temp1 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *temp2 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *temp3 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *temp4 = (float *)calloc(chan_buf_len, sizeof(float));
+
+    //gain
+    float gain1 = 0.25;
+
+    //ESP_ERROR_CHECK(dsps_mulc_f32_ae32(ch1, temp1, chan_buf_len, gain1, 10, 10));
+    //ESP_ERROR_CHECK(dsps_mulc_f32_ae32(temp1, ch1, chan_buf_len, 1.0f, 10, 10));
     
-    for(int i = 0; i<(k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)); i++){
-        ch1[i]*=1;
-        //ch2[i]*=1.5f;
-        temp3[i] = ch3[i];
-    }
-    dsps_addc_f32_ae32(ch2, ch2, (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), 1.2f, 1, 1);
+    //dsps_addc_f32_ae32(ch2, ch2, (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), 1.2f, 1, 1);
     
-    ESP_ERROR_CHECK(dsps_biquad_f32_ae32( temp3, ch3, (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), coeff, w));
+    //ESP_ERROR_CHECK(dsps_biquad_f32_ae32( temp3, ch3, (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), coeff, w));
+
+    //free the memory from temp arrays
+    free(temp1);
+    free(temp2);
     free(temp3);
+    free(temp4);
 }
 
 void groupdelay(){
@@ -193,21 +201,21 @@ void i2s_loop(){
     
     //Defines a buffer as dynamic array with k_buffer*BitdWidth*2/8 length. 
     //When using 24bit stereo there are 3 times 8bit -> 24bit audio left channel followed by 0x00. Then comes the right channel.
-    int8_t *data_0 = (int8_t *)calloc(1, k_buffer*BitWidth*2/8); 
-    int8_t *data_1 = (int8_t *)calloc(1, k_buffer*BitWidth*2/8);
+    int8_t *data_0 = (int8_t *)calloc(1, i2s_buf_len); 
+    int8_t *data_1 = (int8_t *)calloc(1, i2s_buf_len);
     
 
     //float data-buffer per channel
-    float *chan0 = (float *)calloc((k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), sizeof(float));
-    float *chan1 = (float *)calloc((k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), sizeof(float));
-    float *chan2 = (float *)calloc((k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), sizeof(float));
-    float *chan3 = (float *)calloc((k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), sizeof(float));
+    float *chan0 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *chan1 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *chan2 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *chan3 = (float *)calloc(chan_buf_len, sizeof(float));
 
 
     while(true){
         
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_read(rx_handle_0, data_0, k_buffer*BitWidth*2/8, NULL, 1000));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_read(rx_handle_1, data_1, k_buffer*BitWidth*2/8, NULL, 1000));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_read(rx_handle_0, data_0, i2s_buf_len, NULL, 1000));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_read(rx_handle_1, data_1, i2s_buf_len, NULL, 1000));
         
         //print part buffer
         //printf("\n\n");
@@ -223,7 +231,7 @@ void i2s_loop(){
         //Routing
 
         //EQ 
-        eq(chan2, chan1, chan0, chan3);
+        eq(chan0, chan1, chan2, chan3);
 
 
         //Group Delay
@@ -236,8 +244,8 @@ void i2s_loop(){
         //printf("0x%02X L: 0x%02X 0x%02X 0x%02X   0x%02X R:0x%02X 0x%02X 0x%02X   ", data_0[0], data_0[1] & 0xFF, data_0[2] & 0xFF, data_0[3] & 0xFF, data_0[4], data_0[5] & 0xFF, data_0[6] & 0xFF, data_0[7] & 0xFF);
         //printf("0x%02X L: 0x%02X 0x%02X 0x%02X   0x%02X R:0x%02X 0x%02X 0x%02X \n", data_0[8], data_0[9] & 0xFF, data_0[10] & 0xFF, data_0[11] & 0xFF, data_0[12], data_0[13] & 0xFF, data_0[14] & 0xFF, data_0[15] & 0xFF);
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_write(tx_handle_0, data_0, k_buffer*BitWidth*2/8, NULL, NULL));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_write(tx_handle_1, data_1, k_buffer*BitWidth*2/8, NULL, NULL));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_write(tx_handle_0, data_0, i2s_buf_len, NULL, NULL));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_write(tx_handle_1, data_1, i2s_buf_len, NULL, NULL));
 
     //vTaskDelay(2000);
     }
@@ -249,7 +257,7 @@ void i2s_loop(){
     free(chan3);
 }
 
-void testsetup(){
+void filtersetup(){
     //iir coeff
     coeff = (float *)calloc(5, 4);
     w = (float *)calloc(5, 4);
@@ -257,7 +265,6 @@ void testsetup(){
         w[i] = 0;
     }
     ESP_ERROR_CHECK(dsps_biquad_gen_lpf_f32(coeff, 120.0f/Samplerate, 0.707f));
-    //Implementieren als calloc
 }
 
 void app_main(void)
@@ -267,10 +274,15 @@ void app_main(void)
     gpio_set_direction(2, GPIO_MODE_OUTPUT);
     gpio_set_level(2, 1);
 
-    testsetup();
-    //i2s part
+    filtersetup();
+
+    //initialising i2s
     i2s_init();
+
+    //reading, processing and writing audio data
     i2s_loop();
+
+    //free arrays
     free(coeff);
     free(w);
 }
