@@ -6,7 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-
+#include "dsps_mulc.h"
 #include "esp_dsp.h"
 
 //Define Pins
@@ -27,11 +27,18 @@
 #define Samplerate 96000
 #define k_buffer 1280
 #define i2s_buf_len (k_buffer*BitWidth*2/8)
-#define chan_buf_len (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1))
+#define chan_buf_len (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)) //might be different when BitWidth not 24
 
 //iir
-float *coeff;
-float *w;
+float *c_1lp;
+float *w_1lp;
+
+float *c_1hp;
+float *w_1hp1;
+float *w_1hp2;
+
+float *c_2hp;
+float *w_2hp;
 
 //I2S-Controller 0  Handles
 static i2s_chan_handle_t tx_handle_0;
@@ -46,9 +53,13 @@ void converting(int8_t *in, float *left, float *right){
     int j = 0;
     
     for(int i = 0; i < chan_buf_len; i++){
-        left[i] = ((float)(((in[j+1] << 16) & 0xFF0000) | ((in[j+2] << 8) & 0xFF00) | (in[j+3] & 0xFF)))/8388608.0f;
-       
-        right[i] = (float)(((in[j+5] << 16) & 0xFF0000) | ((in[j+6] << 8) & 0xFF00) | (in[j+7] & 0xFF))/8388608.0f;
+        int32_t l = ((((in[j+3]) << 16)&0xFF0000) | ((in[j+2] << 8)&0xFF00) | ((in[j+1])&0xFF));
+        if(l & 0x00800000) l |= 0xFF000000;
+        left[i] = (float)l/8388608.0f;
+
+        int32_t r = ((((in[j+7]) << 16)&0xFF0000) | ((in[j+6] << 8)&0xFF00) | ((in[j+5])&0xFF));
+        if(r & 0x00800000) r |= 0xFF000000;
+        right[i] = (float)l/8388608.0f;
 
         j += 2 * (BitWidth/8 + 1);
     }
@@ -58,52 +69,86 @@ void converting(int8_t *in, float *left, float *right){
 //seperating channel buffers and converting from 1x32bit float valued buffers with values between 1 and -1 into 3x8bit int i2s buffer
 void reconverting(int8_t *out, float *left, float *right){
     int j = 0;
-    for(int i = 0; i < (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)); i++){
+    for(int i = 0; i < chan_buf_len; i++){
 
             //Left
-        float l = 8388608.0f*left[i];
+        int32_t l = (int32_t)(2147483648.0f*left[i]);
         out[j] = 0x00;
-        out[j+1] = (int8_t)(((int32_t)(l) >> 16) & 0xFF);
-        out[j+2] = (int8_t)(((int32_t)(l) >> 8) & 0xFF);
-        out[j+3] = (int8_t)((int32_t)(l) & 0xFF);
+        out[j+3] = (int8_t)((l >> 24) & 0xFF);
+        out[j+2] = (int8_t)((l >> 16) & 0xFF);
+        out[j+1] = (int8_t)((l >> 8)& 0xFF);
 
 
             //Right
-        float r = 8388608.0f*right[i];
+        int32_t r = (int32_t)(2147483648.0f*right[i]);
         out[j+4] = 0x00;
-        out[j+5] = (int8_t)(((int32_t)(r) >> 16) & 0xFF);
-        out[j+6] = (int8_t)(((int32_t)(r) >> 8) & 0xFF);
-        out[j+7] = (int8_t)((int32_t)(r) & 0xFF);
+        out[j+7] = (int8_t)((r >> 24) & 0xFF);
+        out[j+6] = (int8_t)((r >> 16) & 0xFF);
+        out[j+5] = (int8_t)((r >> 8) & 0xFF);
 
 
         j+=2*(BitWidth/8 + 1);
     } 
 }
 
-//evtl output als 4 kanäle
-void eq(float *ch1, float *ch2, float *ch3, float *ch4){
+//equalizer in the future
+void eq(float *A, float *B, float *C, float *D){
     //temp arrays
-    float *temp1 = (float *)calloc(chan_buf_len, sizeof(float));
-    float *temp2 = (float *)calloc(chan_buf_len, sizeof(float));
-    float *temp3 = (float *)calloc(chan_buf_len, sizeof(float));
-    float *temp4 = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempA = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempB = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempC = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempD = (float *)calloc(chan_buf_len, sizeof(float));
 
     //gain
-    float gain1 = 0.25;
+    float gain = 1;
 
-    //ESP_ERROR_CHECK(dsps_mulc_f32_ae32(ch1, temp1, chan_buf_len, gain1, 10, 10));
-    //ESP_ERROR_CHECK(dsps_mulc_f32_ae32(temp1, ch1, chan_buf_len, 1.0f, 10, 10));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(A, tempA, chan_buf_len, gain, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(tempA, A, chan_buf_len, 1.0f, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(B, tempB, chan_buf_len, gain, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(tempB, B, chan_buf_len, 1.0f, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(C, tempC, chan_buf_len, gain, 1, 1));
+    //ESP_ERROR_CHECK(dsps_mulc_f32_ae32(tempC, C, chan_buf_len, 1.0f, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(D, tempD, chan_buf_len, gain, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(tempD, D, chan_buf_len, 1.0f, 1, 1));
     
-    //dsps_addc_f32_ae32(ch2, ch2, (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), 1.2f, 1, 1);
-    
-    //ESP_ERROR_CHECK(dsps_biquad_f32_ae32( temp3, ch3, (k_buffer*BitWidth*2/8)/(2*(BitWidth/8 + 1)), coeff, w));
+    //ESP_ERROR_CHECK(dsps_biquad_f32_ae32( tempC, C, chan_buf_len, coeff, w));
 
     //free the memory from temp arrays
-    free(temp1);
-    free(temp2);
-    free(temp3);
-    free(temp4);
+    free(tempA);
+    free(tempB);
+    free(tempC);
+    free(tempD);
 }
+
+
+//2.1 System
+void twodotone(float *A, float *B, float *C, float *D){
+    //temp arrays
+    float *tempA = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempB = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempC = (float *)calloc(chan_buf_len, sizeof(float));
+    float *tempD = (float *)calloc(chan_buf_len, sizeof(float));
+
+    //gain
+    float gain = 0.5;
+
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(A, tempA, chan_buf_len, gain, 1, 1));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(B, tempB, chan_buf_len, gain, 1, 1));
+
+    ESP_ERROR_CHECK(dsps_biquad_f32_ae32( A, tempC, chan_buf_len, c_2hp, w_2hp));
+    ESP_ERROR_CHECK(dsps_biquad_f32_ae32( tempC, C, chan_buf_len, c_1lp, w_1lp));
+    ESP_ERROR_CHECK(dsps_mulc_f32_ae32(C, D, chan_buf_len, 1.0f, 1, 1));
+
+    ESP_ERROR_CHECK(dsps_biquad_f32_ae32( tempA, A, chan_buf_len, c_1hp, w_1hp1));
+    ESP_ERROR_CHECK(dsps_biquad_f32_ae32( tempB, B, chan_buf_len, c_1hp, w_1hp2));
+
+    //free the memory from temp arrays
+    free(tempA);
+    free(tempB);
+    free(tempC);
+    free(tempD);
+}
+
 
 void groupdelay(){
 
@@ -228,12 +273,16 @@ void i2s_loop(){
         converting(data_0, chan0, chan1);
         converting(data_1, chan2, chan3);
 
+        //printf("%f %f %f   %f %f %f\n", chan0[0], chan0[1], chan0[2], chan1[0], chan1[1], chan1[2]);
         //Routing
 
         //EQ 
-        eq(chan0, chan1, chan2, chan3);
+        //eq(chan0, chan1, chan2, chan3);
 
+        twodotone(chan0, chan1, chan2, chan3);
 
+        //printf("%f %f %f   %f %f %f\n", chan0[0]/0.3, chan0[1]/0.3, chan0[2]/0.3, chan1[0]/0.3, chan1[1]/0.3, chan1[2]/0.3);
+        //printf("%f %f %f   %f %f %f\n", chan0[0], chan0[1], chan0[2], chan1[0], chan1[1], chan1[2]);
         //Group Delay
         //groupdelay();
 
@@ -247,7 +296,7 @@ void i2s_loop(){
     ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_write(tx_handle_0, data_0, i2s_buf_len, NULL, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_write(tx_handle_1, data_1, i2s_buf_len, NULL, NULL));
 
-    //vTaskDelay(2000);
+    //vTaskDelay(200);
     }
     free(data_0);
     free(data_1);
@@ -259,12 +308,22 @@ void i2s_loop(){
 
 void filtersetup(){
     //iir coeff
-    coeff = (float *)calloc(5, 4);
-    w = (float *)calloc(5, 4);
+    c_1lp = (float *)calloc(5, sizeof(float));
+    w_1lp = (float *)calloc(5, sizeof(float));
+    c_1hp = (float *)calloc(5, sizeof(float));
+    w_1hp1 = (float *)calloc(5, sizeof(float));
+    w_1hp2 = (float *)calloc(5, sizeof(float));
+    c_2hp = (float *)calloc(5, sizeof(float));
+    w_2hp = (float *)calloc(5, sizeof(float));
     for(int i = 0; i<5; i++){
-        w[i] = 0;
+        w_1lp[i] = 0;
+        w_1hp1[i] = 0;
+        w_1hp2[i] = 0;
+        w_2hp[i] = 0;
     }
-    ESP_ERROR_CHECK(dsps_biquad_gen_lpf_f32(coeff, 120.0f/Samplerate, 0.707f));
+    ESP_ERROR_CHECK(dsps_biquad_gen_lpf_f32(c_1lp, 105.0f/Samplerate, 0.707f));
+    ESP_ERROR_CHECK(dsps_biquad_gen_hpf_f32(c_1hp, 105.0f/Samplerate, 0.707f));
+    ESP_ERROR_CHECK(dsps_biquad_gen_hpf_f32(c_2hp, 35.0f/Samplerate, 0.707f));
 }
 
 void app_main(void)
@@ -282,7 +341,4 @@ void app_main(void)
     //reading, processing and writing audio data
     i2s_loop();
 
-    //free arrays
-    free(coeff);
-    free(w);
 }
